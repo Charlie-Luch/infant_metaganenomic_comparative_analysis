@@ -1,0 +1,412 @@
+###############################################################################################################################################
+########This code is for Figure 1 in main text and supplementary fugure to show Taxa by income group and age also ARG abundance, without the map
+###############################################################################################################################################
+
+#load packages
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(microViz)
+
+#########This is following the creation of a phyloseq object called phylo
+
+#Ensure the factor levels for income_group
+sample_data(phylo)$income_group <- factor(sample_data(phylo)$income_group, 
+                                          levels = c("low income", "lower middle income", "upper middle income", "high income"))
+
+#Remove samples with NA in income_group and age_group (none)
+phylo <- subset_samples(phylo, !is.na(income_group) & !is.na(age_group))
+
+#Extract sample data, OTU table, and taxonomic table
+sample_df <- as(sample_data(phylo), "data.frame")
+sample_df <- sample_df %>% rownames_to_column(var = "sample")
+
+otu_df <- as(otu_table(phylo), "matrix")
+tax_df <- as.data.frame(tax_table(phylo))
+
+#Ensure OTU table and taxonomic table are in data frame format
+otu_df <- as.data.frame(otu_df) %>% rownames_to_column(var = "OTU")
+tax_df <- tax_df %>% rownames_to_column(var = "OTU")
+
+#Merge OTU table with taxonomic table to get genus information
+otu_long <- otu_df %>%
+  gather(key = "sample", value = "abundance", -OTU) %>%
+  left_join(tax_df, by = "OTU") %>%
+  filter(!is.na(Genus)) # Ensure that you only keep rows with Genus information#############change between Genus and species
+
+#Summarize the abundance by genus and get the top 10 genera
+top_genera <- otu_long %>%
+  group_by(Genus) %>%
+  summarize(total_abundance = sum(abundance, na.rm = TRUE)) %>%
+  arrange(desc(total_abundance)) %>%
+  slice_head(n = 10) %>%
+  pull(Genus)
+
+#Label genera not in the top 10 as "Other"
+otu_long <- otu_long %>%
+  mutate(Genus = ifelse(Genus %in% top_genera, Genus, "Other"))
+
+#Re-order Genus factor levels
+genus_levels <- otu_long %>%
+  group_by(Genus) %>%
+  summarize(total_abundance = sum(abundance, na.rm = TRUE)) %>%
+  arrange(desc(total_abundance)) %>%
+  pull(Genus)
+
+genus_levels <- c(genus_levels[genus_levels != "Other"], "Other")
+otu_long$Genus <- factor(otu_long$Genus, levels = genus_levels)
+
+#Aggregate the abundance data for plotting and calculate relative abundance
+agg_df <- otu_long %>%
+  left_join(sample_df, by = "sample") %>%
+  group_by(age_group, income_group, Genus) %>%
+  summarize(total_abundance = sum(abundance, na.rm = TRUE), .groups = 'drop') %>%
+  group_by(age_group, income_group) %>%
+  mutate(relative_abundance = total_abundance / sum(total_abundance, na.rm = TRUE)) %>%
+  ungroup()
+
+#Generate the palette for top 30 genera and add "Other" as grey (here my interest is top 10) 
+top_genera_palette <- distinct_palette(n = 37)
+top_genera_palette <- c(top_genera_palette, "Other" = "grey")
+
+#Ensure the colors are assigned correctly, mapping "Other" to grey
+genus_palette <- setNames(top_genera_palette, genus_levels)
+
+agg_df$income_group <- factor(agg_df$income_group, 
+                              levels = c("low income", "lower middle income", "upper middle income", "high income"),
+                              labels = c("Low", "Lower middle", "Upper middle", "High"))
+
+top_genera_palette <- c(
+  "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+  "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+  "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+  "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5",
+  "#393b79", "#5254a3", "#6b6ecf", "#9c9ede", "#637939",
+  "#8ca252", "#b5cf6b", "#cedb9c", "#8c6d31", "#bd9e39",
+  "#e7ba52", "#e7cb94", "#843c39", "#ad494a", "#d6616b",
+  "#e7969c", "#7b4173",
+  "lightgrey")  # Grey for "Other"
+
+
+genus_palette <- setNames(top_genera_palette, genus_levels)
+
+
+#Plotting with faceting by age_group and stacking by Genus within income_group
+gen <- ggplot(agg_df, aes(x = income_group, y = relative_abundance, fill = Species)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_grid(~ age_group, scales = "free_x") +
+  scale_fill_manual(values = genus_palette) +  # Apply the custom palette
+  labs(x = "Income Group", y = "Relative Abundance", fill = "Species") +
+  theme_pubclean() +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 14),  # Adjust legend text size if needed
+    legend.title = element_text(size = 14), # Adjust legend title size if needed
+    axis.text.x = element_text(size = 14, angle = 90, vjust = 0.5, hjust = 1),  # Increase x-axis text size and rotate
+    axis.text.y = element_text(size = 14),  # Increase y-axis text size
+    axis.title.x = element_text(size = 14), # Increase x-axis label text size
+    axis.title.y = element_text(size = 14), # Increase y-axis label text size
+    strip.text = element_text(size = 14)    # Increase facet label text size) +
+  guides(fill = guide_legend(ncol = 3)) +  # Spread the legend over 1 column
+  ggtitle("B")
+
+ggsave("taxa_supp_species.svg", plot = gen, dpi = 300, width = 12.6, height = 12.6, bg = "white")
+
+
+##################################################################
+##################################################################ADD SIG TO TAXA IN THE SUPP files
+
+library(dunn.test)
+
+#Agglomerate to genus level
+phylo_genus <- tax_glom(phylo, taxrank = "Genus")
+
+#Convert to a long-format data frame
+genus_df <- psmelt(phylo_genus)
+
+#Define genera of interest
+genera_of_interest <- c("Escherichia", "Staphylococcus", "Enterococcus", 
+                        "Prevotella", "Bifidobacterium", "Bacteroides")
+
+#Filter data for genera of interest
+filtered_df <- genus_df %>%
+  filter(Genus %in% genera_of_interest)
+
+#Summarize data by genus and sample
+summary_df <- filtered_df %>%
+  group_by(Sample, Genus, age_group, income_group) %>%
+  summarize(mean_abundance = mean(Abundance), .groups = "drop")
+
+ggplot(filtered_df, aes(x = age_group, y = Abundance, fill = income_group)) +
+  geom_boxplot(alpha = 0.6) +
+  #geom_jitter(width = 0.2, size = 1, alpha = 0.7) +
+  facet_wrap(~ Genus, scales = "free_y") +
+  labs(x = "Age Group", y = "Relative Abundance (%)", 
+       title = "Relative Abundance of Selected Genera") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 12))
+
+#Perform Dunn's test for each Genus and Age Group
+dunn_results <- filtered_df %>%
+  group_by(Genus, age_group) %>%
+  filter(n_distinct(income_group) > 1) %>% # Ensure there are at least 2 income groups
+  summarise(
+    test_results = list(
+      dunn.test(
+        x = Abundance,
+        g = income_group,
+        method = "holm",
+        kw = FALSE  # Disable the Kruskal-Wallis check since we are looping)),.groups = "drop")
+
+#Extract significant comparisons from the results
+dunn_summary <- dunn_results %>%
+  mutate(
+    p_values = map(test_results, ~ .x$P.adjusted),
+    comparisons = map(test_results, ~ .x$comparisons)) %>%
+  unnest(cols = c(p_values, comparisons)) %>%
+  filter(p_values < 0.05) # Filter for significant results
+
+#View significant results
+print(dunn_summary)
+
+#Filter by specific age groups
+dunn_summary_3 <- dunn_summary %>% 
+  filter(age_group %in% c("<3", ">12"))
+
+#Separate the comparisons into group1 and group2
+annotation_data <- dunn_summary_3 %>%
+  separate(comparisons, into = c("group1", "group2"), sep = " - ") %>%
+  mutate(
+    label = ifelse(p_values < 0.001, "***", 
+                   ifelse(p_values < 0.01, "**", 
+                          ifelse(p_values < 0.05, "*", ""))),
+    y_position = seq(1, nrow(dunn_summary_3)) * 1.2 # Adjust y-position for visibility)
+
+#Separate the comparisons into group1 and group2
+annotation_data <- dunn_summary_3 %>%
+  separate(comparisons, into = c("group1", "group2"), sep = " - ") %>%
+  mutate(
+    label = ifelse(p_values < 0.001, "***", 
+                   ifelse(p_values < 0.01, "**", 
+                          ifelse(p_values < 0.05, "*", ""))),
+    y_position = seq(1, nrow(dunn_summary_3)) * 1.2 # Adjust y-position for visibility)
+
+
+#Filter the data for <3 and >12 age groups
+filtered_df_selected <- filtered_df %>%
+  filter(age_group %in% c("<3", ">12"))
+
+annotation_data <- data.frame(
+  Genus = c(
+    "Bacteroides", "Bacteroides", "Bacteroides", "Bacteroides", "Bacteroides", "Bacteroides",
+    "Bifidobacterium", "Bifidobacterium",
+    "Enterococcus", "Enterococcus",
+    "Escherichia", "Escherichia", "Escherichia", "Escherichia",
+    "Prevotella", "Prevotella", "Prevotella", "Prevotella", "Prevotella", "Prevotella", "Prevotella", "Prevotella",
+    "Staphylococcus", "Staphylococcus"),
+  age_group = c(
+    "<3", ">12", ">12", ">12", ">12", ">12",
+    "<3", ">12",
+    "<3", "<3",
+    "<3", ">12", ">12", ">12",
+    "<3", "<3", "<3", ">12", ">12", ">12", ">12", ">12",
+    "<3", "<3"),
+  group1 = c(
+    "high income", "high income", "high income", "low income", "low income", "lower middle income",
+    "high income", "high income",
+    "high income", "high income",
+    "high income", "high income", "low income", "low income",
+    "high income", "high income", "low income", "high income", "high income", "high income", "low income", "lower middle income",
+    "high income", "high income"),
+  group2 = c(
+    "lower middle income", "low income", "lower middle income", "lower middle income", "upper middle income", "upper middle income",
+    "lower middle income", "lower middle income",
+    "low income", "lower middle income",
+    "lower middle income", "low income", "lower middle income", "upper middle income",
+    "low income", "lower middle income", "lower middle income", "low income", "lower middle income", "upper middle income", "upper middle income", "upper middle income",
+    "low income", "lower middle income"),
+  x_start = c(
+    4, 1, 4, 1, 1, 1,
+    2, 2,
+    1, 2,
+    2, 1, 1, 1,
+    1, 2, 1, 1, 2, 3, 1, 2,
+    1, 2),
+  x_end = c(
+    2, 4, 2, 2, 2, 3,
+    4, 4,
+    4, 4,
+    4, 4, 2, 3,
+    4, 4, 2, 4, 4, 4, 3, 3,
+    4, 4),
+  y_position = c(
+    88, 78, 73, 68, 62, 57,
+    100, 80,
+    99, 105,
+    100, 70, 55, 62,
+    75, 65, 60, 89, 83, 70, 75, 69,
+    100, 94),
+  label_position = c(
+    90, 80, 75, 70, 64, 59,
+    102, 82,
+    101, 107,
+    101, 72, 57, 65,
+    78, 68, 62, 91, 85, 72, 77, 71,
+    102, 96),
+  label = c(
+    "***", "**", "***", "**", "*", "***",
+    "**", "***",
+    "*", "***",
+    "***", "***", "***", "***",
+    "***", "***", "***", "***", "***", "*", "***", "***",
+    "*", "***")) #based on the the results above
+
+#Rename income group levels
+filtered_df_selected <- filtered_df_selected %>%
+  mutate(
+    income_group = recode(
+      income_group,
+      "low income" = "Low",
+      "lower middle income" = "Lower middle",
+      "upper middle income" = "Upper middle",
+      "high income" = "High"))
+
+
+#Define the plot with Set 3 colors
+taxa_supp <- ggplot(filtered_df_selected, aes(x = income_group, y = Abundance, fill = income_group)) +
+  geom_boxplot(alpha = 0.5) +
+  facet_wrap(~ Genus + age_group, scales = "free_y") +
+  geom_segment(
+    data = annotation_data,
+    aes(x = x_start, xend = x_end, y = y_position, yend = y_position),
+    inherit.aes = FALSE) +
+  geom_text(
+    data = annotation_data,
+    aes(x = (x_start + x_end) / 2, y = label_position, label = label),
+    inherit.aes = FALSE) +
+  labs(
+    x = "",
+    y = "Relative Abundance (%)",
+    title = "Genera Abundance by Income Groups for <3 and >12 by Age Groups",
+    fill = "Income group") +
+  scale_fill_manual(
+    values = c("Low" = "#8DD3C7", 
+               "Lower middle" = "#FFFFB3", 
+               "Upper middle" = "#BEBADA", 
+               "High" = "#FB8072") # Set 3 palette colors) +
+  theme_clean(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 14))
+
+ggsave("taxa_supp.tiff", plot = taxa_supp, dpi = 300, width = 10, height = 10, bg = "white")
+
+
+########################################################################################
+#####################################################################################
+#################### ADD SAMPLE SIZES
+# Ensure the factor levels for income_group
+sample_data(phylo)$income_group <- factor(sample_data(phylo)$income_group, 
+                                          levels = c("low income", "lower middle income", "upper middle income", "high income"))
+
+#Extract sample data
+sample_df <- as(sample_data(phylo), "data.frame")
+sample_df <- sample_df %>% rownames_to_column(var = "sample")
+
+#Aggregate the abundance data for plotting and calculate relative abundance
+agg_df <- otu_long %>%
+  left_join(sample_df, by = "sample") %>%
+  group_by(age_group, income_group, Genus) %>%
+  summarize(total_abundance = sum(abundance, na.rm = TRUE), .groups = 'drop') %>%
+  group_by(age_group, income_group) %>%
+  mutate(relative_abundance = total_abundance / sum(total_abundance, na.rm = TRUE)) %>%
+  ungroup()
+
+sample_sizes <- tibble(
+  age_group = factor(c("<3", "<3", "<3", "3-6", "3-6", "3-6", "3-6", "6-12", "6-12", "6-12", "6-12", ">12", ">12", ">12", ">12")),
+  income_group = factor(c("Low", "Lower middle", "High", "Low", "Lower middle", "Upper middle", "High",
+                          "Low", "Lower middle", "Upper middle", "High", "Low", "Lower middle", "Upper middle", "High")),
+  sample_size = c(3, 105, 1104, 2, 71, 7, 122, 53, 39, 40, 108, 47, 104, 57, 76))
+
+sample_sizes <- sample_sizes %>%
+  mutate(income_group = factor(income_group, levels = c("Low", "Lower middle", "Upper middle", "High")))
+
+top_genera_palette <- distinct_palette(n = 10)
+top_genera_palette <- c(top_genera_palette, "Other" = "grey")
+
+genus_palette <- setNames(top_genera_palette, genus_levels)
+
+agg_df$income_group <- factor(agg_df$income_group, 
+                              levels = c("low income", "lower middle income", "upper middle income", "high income"),
+                              labels = c("Low", "Lower middle", "Upper middle", "High"))
+
+
+##########################################plot supp file with sample sizs
+
+gen <- ggplot(agg_df, aes(x = income_group, y = relative_abundance, fill = Genus)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_grid(~ age_group, scales = "free_x", switch = "x") +
+  scale_fill_manual(values = genus_palette, name = "Genus") +  # Apply the custom palette for Genus
+  labs(x = "", y = "Relative Abundance", fill = "Genus") +
+  scale_y_continuous(
+    breaks = seq(0, 1, by = 0.1),  # Set y-axis breaks to increments of 0.1
+    labels = function(x) sprintf("%.1f", x)  # Format labels to show one decimal place (e.g., 0.0) ) +
+  #geom_hline(data = NULL, yintercept = seq(0, 1, by = 0.1), 
+            # aes(x = NULL), color = "grey80", linetype = "dashed", size = 0.1) +  # Add dashed grey lines per panel
+  theme_clean(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.background = element_blank(),
+    legend.text = element_text(size = 14),  
+    legend.title = element_text(size = 14, face = "plain"), 
+    legend.key.size = unit(1.0, "lines"),  
+    legend.spacing = unit(1.0, "lines"),    
+    axis.text.x = element_blank(),         
+    axis.ticks.x = element_blank(),        
+    axis.line.x = element_blank(),      
+    axis.text.y = element_text(size = 14), 
+    axis.title.x = element_text(size = 14), 
+    axis.title.y = element_text(size = 14),
+    strip.text = element_text(size = 14),  
+    panel.spacing = unit(2, "lines"),     
+    plot.title = element_text(size = 14, face = "plain"),
+    panel.border = element_blank(),        
+    plot.background = element_blank()) +
+  guides(fill = guide_legend(nrow = 3)) +  # Spread the legend over 3 rows
+  ggtitle("B") +
+  geom_label(data = sample_sizes, 
+             aes(x = income_group, y = 1.05, label = sample_size, fill = factor(income_group)), 
+             size = 3, inherit.aes = FALSE, color = "black", label.size = 0.1, 
+             label.padding = unit(0.4, "lines"), show.legend = FALSE) +
+  scale_fill_manual(
+    values = c(genus_palette, income_color_mapping), 
+    breaks = names(genus_palette)  # Keep only Genus in the legend
+  )
+
+ggsave("figure1.taxa.pdf", plot = gen, width = 12, height = 15, dpi = 300)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ggsave("taxa_figure1.svg", plot = gen, width = 10, height = 8, dpi = 600)
