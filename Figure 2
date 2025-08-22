@@ -1,0 +1,239 @@
+##########################################################################
+# PCoA + PERMANOVA + PERMDISP analysis
+##########################################################################
+
+#load
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(vegan)
+  library(RColorBrewer)
+  library(patchwork)
+  library(cowplot)
+  library(tibble)
+  library(dplyr)})
+
+set.seed(133)
+
+INFILE  <- "updated_amr_metadata.csv"
+OUT_DIR <- "figures"
+TAB_DIR <- "tables"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TAB_DIR, showWarnings = FALSE, recursive = TRUE)
+
+#Load the metdata file and cleanup column names and variables
+amr <- read.csv("updated_amr_metadata.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+
+amr <- amr %>%
+  mutate(delivery_mode = dplyr::case_when(
+      delivery_mode == "cesarean" ~ "caesarean",
+      delivery_mode == "forceps_vacuum" ~ "vaginal",
+      delivery_mode == "unknown" ~ NA_character_,
+      TRUE ~ delivery_mode),
+    age_group = cut(age_months,
+      breaks = c(-Inf, 3, 6, 12, Inf),
+      labels = c("<3", "3-6", "6-12", ">12"),
+      include.lowest = TRUE),
+    feeding_method = dplyr::recode(feeding_method,
+      "exclusive formula" = "formula",
+      "exclusive breastfeeding" = "breastfeeding",
+      "unknown" = NA_character_)) 
+
+#one-row-per-sample metadata
+meta0 <- amr %>%
+  dplyr::select(biosample, country, income_group, feeding_method, delivery_mode, age_months, age_group) %>%
+  distinct(biosample, .keep_all = TRUE)
+
+#order + labels for income group
+meta0$income_group <- dplyr::recode(
+  meta0$income_group,
+  "low income" = "Low",
+  "lower middle income" = "Lower middle",
+  "upper middle income" = "Upper middle",
+  "high income" = "High")
+
+meta0$income_group <- factor(meta0$income_group, levels = c("Low","Lower middle","Upper middle","High"))
+meta0$age_group <- factor(meta0$age_group,    levels = c("<3","3-6","6-12",">12"))
+
+#Build biosample x ARO matrix, Bray-Curtis
+mat_long <- amr %>%
+  group_by(biosample, aro_term) %>%
+  summarise(rpkm_sum = sum(rpkm, na.rm = TRUE), .groups = "drop")
+
+mat <- mat_long %>%
+  tidyr::pivot_wider(names_from = aro_term, values_from = rpkm_sum, values_fill = 0) %>%
+  arrange(biosample)
+
+#####run bray
+mat_log <- mat %>%
+  mutate(across(-biosample, ~ log10(.x + 1)))
+rownames(mat_log) <- mat_log$biosample
+D_bray <- vegdist(as.matrix(mat_log[ , -1, drop = FALSE]), method = "bray")
+labels <- attr(D_bray, "Labels")
+
+#########PCoA (2D) and plotting DF
+pcoa_res <- cmdscale(D_bray, k = 2)
+pcoa_df  <- data.frame(biosample = labels, PC1 = pcoa_res[,1], PC2 = pcoa_res[,2]) %>%
+  left_join(meta0, by = "biosample")
+
+##########ARG per sample
+rpkm_tot <- amr %>%
+  group_by(biosample) %>%
+  summarise(rpkm = sum(rpkm, na.rm = TRUE), .groups = "drop")
+pcoa_df <- left_join(pcoa_df, rpkm_tot, by = "biosample") %>%
+  mutate(rpkm_log = log10(rpkm + 1))
+
+###functions: PERMANOVA + pretty p + annotate position
+format_p <- function(p) ifelse(is.na(p), "p = NA", ifelse(p < 1e-4, "p < 1e-4", sprintf("p = %.3f", p)))
+
+run_permanova <- function(D, meta, var){
+  df <- meta %>%
+    dplyr::select(biosample, !!sym(var)) %>%
+    filter(!is.na(.data[[var]])) %>%
+    column_to_rownames("biosample")
+  keep <- rownames(df)
+  M   <- as.matrix(D)
+  M   <- M[keep, keep, drop = FALSE]
+  if (nrow(M) < 2) return(tibble(factor = var, F = NA, R2 = NA, p = NA, n = length(keep)))
+  Dsub <- as.dist(M)
+  fit  <- adonis2(Dsub ~ df[[var]], permutations = 9999)
+  tibble(
+    factor = var,
+    F  = unname(fit$F[1]),
+    R2 = unname(fit$R2[1]),
+    p  = unname(fit$`Pr(>F)`[1]),
+    n  = length(keep),
+    k  = nlevels(factor(df[[var]])))}
+
+#where to place the annotation text
+anno_xy <- function(x, y){
+  xr <- range(x, na.rm = TRUE); yr <- range(y, na.rm = TRUE)
+  c(x = xr[1] + 0.02 * diff(xr), y = yr[2] - 0.02 * diff(yr))}
+
+#unified white theme
+fix_theme <- theme(
+  panel.background = element_rect(fill = "white", colour = NA),
+  plot.background  = element_rect(fill = "white", colour = NA),
+  legend.background= element_rect(fill = "white", colour = NA),
+  legend.key  = element_rect(fill = "white", colour = NA),
+  text   = element_text(colour = "black"))
+
+###########Plot builders
+make_plot_income <- function(df, ptxt){
+  set3 <- brewer.pal(4, "Set3")
+  ord  <- levels(df$income_group)
+  pos  <- anno_xy(df$PC1, df$PC2)
+  ggplot(df, aes(PC1, PC2, color = income_group)) +
+    geom_point(size = 1.8) +
+    scale_color_manual(values = setNames(set3, ord), drop = TRUE, na.translate = FALSE) +
+    labs(x = "PC1", y = "PC2", color = "Income") +
+    annotate("text", x = pos["x"], y = pos["y"], label = ptxt, size = 3, color = "black", hjust = 0) +
+    theme_classic() + fix_theme + ggtitle("B. Income group") +
+    theme(legend.position = "bottom")}
+
+make_plot_age <- function(df, ptxt){
+  set1 <- brewer.pal(4, "Set1")
+  pos  <- anno_xy(df$PC1, df$PC2)
+  ggplot(df, aes(PC1, PC2, color = age_group)) +
+    geom_point(size = 1.8) +
+    scale_color_manual(values = setNames(set1, levels(df$age_group)), drop = TRUE, na.translate = FALSE) +
+    labs(x = "PC1", y = "PC2", color = "Age group") +
+    annotate("text", x = pos["x"], y = pos["y"], label = ptxt, size = 3, color = "black", hjust = 0) +
+    theme_classic() + fix_theme + ggtitle("A. Age group") +
+    theme(legend.position = "bottom")}
+
+make_plot_feeding <- function(df, ptxt){
+  pos <- anno_xy(df$PC1, df$PC2)
+  ggplot(df, aes(PC1, PC2)) +
+    geom_point(data = dplyr::filter(df, is.na(feeding_method)), aes(color = "NA"), size = 1.8, alpha = 0.5) +
+    geom_point(data = dplyr::filter(df, !is.na(feeding_method)), aes(color = feeding_method), size = 1.8) +
+    scale_color_manual(values = c(breastfeeding = "lightblue", formula = "lightgreen", mixed = "orange", NA = "grey"),
+                       breaks = c("breastfeeding", "formula", "mixed", "NA"),
+                       labels = c("breastfeeding", "formula", "mixed", "NA"),
+                       name = "Feeding") +
+    labs(x = "PC1", y = "PC2") +
+    annotate("text", x = pos["x"], y = pos["y"], label = ptxt, size = 3, color = "black", hjust = 0) +
+    theme_classic() + fix_theme + ggtitle("C. Feeding method") +
+    theme(legend.position = "bottom")}
+
+make_plot_delivery <- function(df, ptxt){
+  pos <- anno_xy(df$PC1, df$PC2)
+  ggplot(df, aes(PC1, PC2)) +
+    geom_point(data = dplyr::filter(df, is.na(delivery_mode)), aes(color = "NA"), size = 1.8, alpha = 0.5) +
+    geom_point(data = dplyr::filter(df, !is.na(delivery_mode)), aes(color = delivery_mode), size = 1.8) +
+    scale_color_manual(values = c(caesarean = "brown", vaginal = "lightblue", NA = "grey"),
+                       breaks = c("vaginal", "caesarean", "NA"),
+                       labels = c("vaginal", "caesarean", "NA"),
+                       name = "Delivery") +
+    labs(x = "PC1", y = "PC2") +
+    annotate("text", x = pos["x"], y = pos["y"], label = ptxt, size = 3, color = "black", hjust = 0) +
+    theme_classic() + fix_theme + ggtitle("D. Delivery mode") +
+    theme(legend.position = "bottom")}
+
+################PERMANOVA per factor + plots
+meta_for_adonis <- pcoa_df %>%
+  dplyr::select(biosample, income_group, age_group, feeding_method, delivery_mode) %>%
+  distinct(biosample, .keep_all = TRUE)
+
+#Make a named list of permanova results
+perms <- list(
+  income_group   = run_permanova(D_bray, meta_for_adonis, "income_group"),
+  age_group      = run_permanova(D_bray, meta_for_adonis, "age_group"),
+  feeding_method = run_permanova(D_bray, meta_for_adonis, "feeding_method"),
+  delivery_mode  = run_permanova(D_bray, meta_for_adonis, "delivery_mode"))
+
+permanova_tbl <- bind_rows(perms) %>% mutate(p_txt = format_p(p))
+readr::write_csv(permanova_tbl, file.path(TAB_DIR, "permanova_bray_results.csv"))
+print(permanova_tbl)
+
+#Build plots with p-value annotations
+p_income <- make_plot_income(pcoa_df,   permanova_tbl$p_txt[permanova_tbl$factor == "income_group"])
+p_age  <- make_plot_age(pcoa_df,  permanova_tbl$p_txt[permanova_tbl$factor == "age_group"])
+p_feed   <- make_plot_feeding(pcoa_df,  permanova_tbl$p_txt[permanova_tbl$factor == "feeding_method"])
+p_deliv  <- make_plot_delivery(pcoa_df, permanova_tbl$p_txt[permanova_tbl$factor == "delivery_mode"])
+
+###############PERMDISP (Bray–Curtis)
+#Safe wrapper (drops groups with <2 samples; removes NAs)
+run_betadisper <- function(D, meta_vec, nperm = 9999, seed = 1L){
+  g <- factor(meta_vec)
+  keep <- !is.na(g)
+  g <- g[keep]
+  M <- as.matrix(D)[keep, keep, drop = FALSE]
+  tab <- table(g); ok <- g %in% names(tab[tab >= 2])
+  g  <- droplevels(g[ok]); M <- M[ok, ok, drop = FALSE]
+  if (nlevels(g) < 2) return(NULL)
+  bd <- betadisper(as.dist(M), g)
+  set.seed(seed)
+  list(
+    bd   = bd,
+    perm = permutest(bd, permutations = nperm),
+    anov = anova(bd),
+    means = tapply(bd$distances, g, mean, na.rm = TRUE))}
+
+meta_align <- meta_for_adonis %>% column_to_rownames("biosample")
+meta_align <- meta_align[labels, , drop = FALSE]
+
+bd_income <- run_betadisper(D_bray, meta_align$income_group)
+bd_age    <- run_betadisper(D_bray, meta_align$age_group)
+bd_feed   <- run_betadisper(D_bray, meta_align$feeding_method)
+bd_deliv  <- run_betadisper(D_bray, meta_align$delivery_mode)
+
+extract_perm <- function(name, x){
+  if (is.null(x)) return(tibble(factor = name, F_perm = NA, p_perm = NA, F_anova = NA, p_anova = NA, n_groups = NA))
+  tibble(
+    factor  = name,
+    F_perm  = unname(x$perm$tab[1,"F"]),
+    p_perm  = unname(x$perm$tab[1,"Pr(>F)"]),
+    F_anova = unname(x$anov$`F value`[1]),
+    p_anova = unname(x$anov$`Pr(>F)`[1]),
+    n_groups = length(x$means))}
+
+permdisp_tbl <- bind_rows(
+  extract_perm("income_group", bd_income),
+  extract_perm("age_group",    bd_age),
+  extract_perm("feeding_method", bd_feed),
+  extract_perm("delivery_mode",  bd_deliv)) %>%
+  mutate(p_txt = format_p(p_perm))
+readr::write_csv(permdisp_tbl, file.path(TAB_DIR, "permdisp_bray_results.csv"))
+print(permdisp_tbl)
+
+
