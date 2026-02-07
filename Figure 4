@@ -1,1 +1,524 @@
+===============================================================================
+                    FIGURE 4: CLUSTERING + TAXA (3 PANELS)
+===============================================================================
 
+###############################################################################
+
+# This script generates all 3 panels of Figure 4:
+# - Panel A: PCoA with k=3 clusters + ARG abundance boxplot inset
+# - Panel B: Species differential abundance (3 comparisons)
+# - Panel C: Income distribution across clusters
+
+# Prerequisites:
+# - "updated_amr_metadata.csv" with AMR and metadata
+# - Phyloseq object with taxonomic data (see data prep section)
+
+###############################################################################
+#                            LOAD LIBRARIES                                   #
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(phyloseq)
+library(FSA)         
+library(vegan)         
+library(scales)       
+library(tibble)        
+
+###################################################################
+#                DEFINE COLORS                                    #
+
+
+cluster_colors_k3 <- c(
+  "1" = "#FB8072",  # Coral/salmon (HIGH ARG)
+  "2" = "#80B1D3",  # Light blue (MEDIUM ARG)
+  "3" = "#66C2A5"   # Teal (LOW ARG))
+
+income_colors <- c(
+  "LIC" = "#8DD3C7",
+  "LMIC" = "#FFFFB3",
+  "UMIC" = "#BEBADA",
+  "HIC" = "#FB8072")
+
+#########################################################################
+#                   STEP 1: LOAD AND PREPARE DATA                        #
+
+
+# Load AMR data
+amr <- read.csv("updated_amr_metadata.csv", header = TRUE, sep = ",", 
+                stringsAsFactors = FALSE)
+
+# Clean delivery mode
+amr <- amr %>%
+  mutate(delivery_mode = case_when(
+    delivery_mode == "cesarean" ~ "caesarean",
+    delivery_mode == "forceps_vacuum" ~ "vaginal",
+    delivery_mode == "unknown" ~ NA_character_,
+    TRUE ~ delivery_mode)) %>%
+  filter(!country == "Tanzania")
+
+# Select columns for analysis
+pcoa <- amr %>% 
+  dplyr::select(biosample, country, aro_term, rpkm, income_group,
+                unique_drug_class, feeding_method, delivery_mode, age_months)
+
+# Create age groups
+pcoa$age_group <- cut(pcoa$age_months,
+                      breaks = c(-Inf, 3, 6, 12, Inf),
+                      labels = c("<3", "3-6", "6-12", ">12"),
+                      include.lowest = TRUE)
+
+# Clean feeding method
+pcoa$feeding_method[pcoa$feeding_method == "exclusive formula"] <- "formula"
+pcoa$feeding_method[pcoa$feeding_method == "exclusive breastfeeding"] <- "breastfeeding"
+pcoa$feeding_method[pcoa$feeding_method == "unknown"] <- NA
+
+###############################################################################
+#                 STEP 2: CREATE DISTANCE MATRIX & PERFORM PCoA              #
+
+
+# Aggregate ARG data by biosample
+pcoa_aggregated <- pcoa %>%
+  group_by(biosample, aro_term) %>%
+  summarize(rpkm_sum = sum(rpkm), .groups = 'drop') %>%
+  spread(aro_term, rpkm_sum, fill = 0)
+
+# Log transform
+pcoa_aggregated <- mutate(pcoa_aggregated, 
+                          across(where(is.numeric), ~ log10(. + 1)))
+
+# Calculate Bray-Curtis distance
+dist_matrix_bray <- vegdist(pcoa_aggregated[, -1], method = "bray")
+
+# Perform PCoA
+pcoa_result <- cmdscale(dist_matrix_bray, k = 3, eig = TRUE)
+
+# Create PCoA dataframe
+pcoa_df_bray <- data.frame(
+  biosample = pcoa_aggregated$biosample,
+  PC1 = pcoa_result$points[, 1],
+  PC2 = pcoa_result$points[, 2])
+
+# Merge with metadata
+pcoa_df_bray <- merge(pcoa_df_bray,
+                      pcoa[, c("biosample", "country", "income_group",
+                              "delivery_mode", "age_group", "feeding_method")],
+                      by = "biosample")
+
+pcoa_df_bray <- pcoa_df_bray %>% distinct(biosample, .keep_all = TRUE)
+
+# Rename income groups
+pcoa_df_bray$income_group <- dplyr::recode(pcoa_df_bray$income_group,
+                                           "low income" = "Low",
+                                           "lower middle income" = "Lower middle",
+                                           "upper middle income" = "Upper middle",
+                                           "high income" = "High")
+
+############################################################################
+#                     STEP 3: PERFORM K-MEANS CLUSTERING (K=3)               
+
+
+set.seed(123)  # For reproducibility
+kmeans_result <- kmeans(pcoa_df_bray[, c("PC1", "PC2")], centers = 3, nstart = 25)
+
+# Add cluster assignments
+pcoa_df_k3 <- pcoa_df_bray
+pcoa_df_k3$cluster <- as.factor(kmeans_result$cluster)
+
+##############################################################################
+#                   STEP 4: CALCULATE ARG ABUNDANCE PER CLUSTER              
+
+
+# Get total ARG abundance per biosample
+amr_rpkm <- amr %>%
+  group_by(biosample) %>%
+  summarise(total_rpkm = sum(rpkm, na.rm = TRUE), .groups = 'drop')
+
+# Join with cluster data
+log10_rpkm_k3 <- pcoa_df_k3 %>%
+  left_join(amr_rpkm, by = "biosample") %>%
+  mutate(log10_rpkm = log10(total_rpkm + 1)) %>%
+  select(biosample, cluster, log10_rpkm, total_rpkm)
+
+#############################################################################
+#         STEP 5: STATISTICAL TESTS - PAIRWISE COMPARISONS FOR RPKM         #
+
+
+pairwise_rpkm <- pairwise.wilcox.test(
+  log10_rpkm_k3$log10_rpkm,
+  log10_rpkm_k3$cluster,
+  p.adjust.method = "bonferroni")
+
+p_1vs2 <- pairwise_rpkm$p.value["2", "1"]
+p_1vs3 <- pairwise_rpkm$p.value["3", "1"]
+p_2vs3 <- pairwise_rpkm$p.value["3", "2"]
+
+# Function to convert p-values to stars
+sig_stars <- function(p) {
+  if(is.na(p)) return("ns")
+  if(p < 0.001) return("***")
+  if(p < 0.01) return("**")
+  if(p < 0.05) return("*")
+  return("ns")}
+
+sig_1vs2 <- sig_stars(p_1vs2)
+sig_1vs3 <- sig_stars(p_1vs3)
+sig_2vs3 <- sig_stars(p_2vs3)
+
+cat("\n=== PAIRWISE RPKM COMPARISONS ===\n")
+cat("Cluster 1 vs 2: p =", format.pval(p_1vs2, digits = 3), sig_1vs2, "\n")
+cat("Cluster 1 vs 3: p =", format.pval(p_1vs3, digits = 3), sig_1vs3, "\n")
+cat("Cluster 2 vs 3: p =", format.pval(p_2vs3, digits = 3), sig_2vs3, "\n")
+
+##########################################################################
+#               PANEL A: PCoA WITH BOXPLOT INSET                         #
+
+
+# Calculate variance explained
+mds <- cmdscale(dist_matrix_bray, k = 2, eig = TRUE)
+eigs <- mds$eig
+denom <- sum(eigs[eigs > 0], na.rm = TRUE)
+variance_explained <- 100 * eigs[1:2] / denom
+
+# Main PCoA plot
+p_pcoa <- ggplot(pcoa_df_k3, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 2, alpha = 0.5) +
+  stat_density_2d(aes(color = cluster), linewidth = 0.7, bins = 6) +
+  scale_color_manual(
+    values = cluster_colors_k3,
+    labels = c("1", "2", "3"),
+    name = "Cluster") +
+  labs(
+    x = paste0("PC1 (", round(variance_explained[1], 2), "%)"),
+    y = paste0("PC2 (", round(variance_explained[2], 2), "%)")) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = c(0.08, 0.92),
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.title = element_text(face = "plain", size = 11),
+    legend.text = element_text(size = 10),
+    axis.title = element_text(face = "plain"),
+    panel.border = element_rect(color = "black", linewidth = 0.5))
+
+# Boxplot inset with significance annotations
+p_inset_small <- ggplot(log10_rpkm_k3, aes(x = cluster, y = log10_rpkm, fill = cluster)) +
+  geom_boxplot(outlier.size = 0.4, linewidth = 0.5, width = 0.6) +
+  scale_fill_manual(values = cluster_colors_k3) +
+  # Significance brackets
+  annotate("segment", x = 1, xend = 3, y = 5.3, yend = 5.3, linewidth = 0.5) +
+  annotate("segment", x = 1, xend = 1, y = 5.3, yend = 5.2, linewidth = 0.5) +
+  annotate("segment", x = 3, xend = 3, y = 5.3, yend = 5.2, linewidth = 0.5) +
+  annotate("text", x = 2, y = 5.4, label = sig_1vs3, size = 3.5, fontface = "bold") +
+  annotate("segment", x = 1, xend = 2, y = 5.05, yend = 5.05, linewidth = 0.5) +
+  annotate("segment", x = 1, xend = 1, y = 5.05, yend = 4.95, linewidth = 0.5) +
+  annotate("segment", x = 2, xend = 2, y = 5.05, yend = 4.95, linewidth = 0.5) +
+  annotate("text", x = 1.5, y = 5.15, label = sig_1vs2, size = 3.5, fontface = "bold") +
+  annotate("segment", x = 2, xend = 3, y = 4.8, yend = 4.8, linewidth = 0.5) +
+  annotate("segment", x = 2, xend = 2, y = 4.8, yend = 4.7, linewidth = 0.5) +
+  annotate("segment", x = 3, xend = 3, y = 4.8, yend = 4.7, linewidth = 0.5) +
+  annotate("text", x = 2.5, y = 4.9, label = sig_2vs3, size = 3.5, fontface = "bold") +
+  labs(x = NULL, y = "Log RPKM") +
+  scale_x_discrete(labels = c("1", "2", "3")) +
+  scale_y_continuous(limits = c(0.5, 5.5)) +
+  theme_classic(base_size = 8) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(size = 10, color = "black"),
+    axis.title.y = element_text(size = 10, face = "plain"),
+    plot.background = element_rect(fill = "white", color = "black", linewidth = 0.8),
+    plot.margin = margin(3, 3, 3, 3))
+
+# Combine PCoA with inset
+panel_a <- p_pcoa +
+  inset_element(p_inset_small, left = 0.35, bottom = 0.7, right = 0.63, top = 0.99)
+
+print(panel_a)
+ggsave("Panel_A_PCoA_with_inset.pdf", panel_a, width = 8, height = 8, dpi = 300)
+
+#############################################################
+#         PANEL B: SPECIES DIFFERENTIAL ABUNDANCE           
+
+
+# NOTE: This section requires a phyloseq object named 'phylo'
+# If you don't have one, you need to create it from your taxonomic data
+# See below for phyloseq creation example
+
+# === CREATE PHYLOSEQ OBJECT
+# This is just an example - adjust based on your actual data structure
+
+# Assuming you have:
+# 1. OTU table: rows = samples, columns = species/OTUs
+# 2. Taxonomy table: rows = species/OTUs, columns = taxonomic ranks
+# 3. Sample metadata
+
+# Example:
+# otu_table_df <- read.csv("otu_table.csv", row.names = 1)
+# tax_table_df <- read.csv("taxonomy_table.csv", row.names = 1)
+# sample_data_df <- pcoa_df_k3
+# 
+# phylo <- phyloseq(
+#   otu_table(as.matrix(otu_table_df), taxa_are_rows = FALSE),
+#   tax_table(as.matrix(tax_table_df)),
+#   sample_data(sample_data_df))
+# 
+
+# ONCE PHYLOSEQ OBJECT EXISTS
+
+# Extract OTU table (samples as rows)
+otu <- as(otu_table(phylo), "matrix")
+if (taxa_are_rows(phylo)) otu <- t(otu)
+otu_df <- as.data.frame(otu)
+otu_df$biosample <- rownames(otu_df)
+
+# Calculate relative abundance (%) per sample
+otu_only <- as.matrix(otu_df[, setdiff(colnames(otu_df), "biosample")])
+otu_rel_only <- sweep(otu_only, 1, rowSums(otu_only, na.rm = TRUE), "/") * 100
+otu_rel <- as.data.frame(otu_rel_only)
+otu_rel$biosample <- rownames(otu_rel_only)
+
+# Join with cluster assignments
+taxa_by_cluster <- otu_rel %>%
+  inner_join(pcoa_df_k3 %>% select(biosample, cluster), by = "biosample")
+
+# Extract taxonomy table
+tax_table_df <- as.data.frame(tax_table(phylo))
+tax_table_df$otu_id <- rownames(tax_table_df)
+
+# Calculate mean abundance and prevalence per cluster
+taxa_means <- taxa_by_cluster %>%
+  pivot_longer(cols = -c(biosample, cluster), 
+               names_to = "otu_id", 
+               values_to = "rel_abundance") %>%
+  group_by(cluster, otu_id) %>%
+  summarise(
+    mean_rel_abundance = mean(rel_abundance, na.rm = TRUE),
+    prevalence = mean(rel_abundance > 0, na.rm = TRUE),
+    .groups = "drop") %>%
+  pivot_wider(
+    id_cols = otu_id,
+    names_from = cluster,
+    values_from = c(mean_rel_abundance, prevalence),
+    names_prefix = "Cluster_") %>%
+  mutate(
+    diff_C1_vs_C2 = mean_rel_abundance_Cluster_1 - mean_rel_abundance_Cluster_2,
+    diff_C1_vs_C3 = mean_rel_abundance_Cluster_1 - mean_rel_abundance_Cluster_3,
+    diff_C2_vs_C3 = mean_rel_abundance_Cluster_2 - mean_rel_abundance_Cluster_3)
+
+# Kruskal-Wallis test with BH correction
+taxa_stats <- taxa_by_cluster %>%
+  pivot_longer(cols = -c(biosample, cluster), 
+               names_to = "otu_id", 
+               values_to = "rel_abundance") %>%
+  group_by(otu_id) %>%
+  summarise(
+    kruskal_p = tryCatch({
+      kruskal.test(rel_abundance ~ cluster)$p.value}, error = function(e) NA_real_),
+    .groups = "drop") %>%
+  filter(!is.na(kruskal_p)) %>%
+  mutate(padj_kruskal = p.adjust(kruskal_p, method = "BH"))
+
+# Dunn's test for pairwise comparisons (only for significant taxa)
+sig_otus <- taxa_stats %>% filter(padj_kruskal < 0.05) %>% pull(otu_id)
+
+pairwise_results <- taxa_by_cluster %>%
+  pivot_longer(cols = -c(biosample, cluster), 
+               names_to = "otu_id", 
+               values_to = "rel_abundance") %>%
+  filter(otu_id %in% sig_otus) %>%
+  group_by(otu_id) %>%
+  summarise(
+    dunn_result = tryCatch({
+      test <- dunnTest(rel_abundance ~ cluster, method = "bonferroni")
+      list(test$res)}, error = function(e) list(NULL)),
+    .groups = "drop") %>%
+  filter(!sapply(dunn_result, is.null)) %>%
+  unnest(dunn_result) %>%
+  mutate(
+    comparison_clean = case_when(
+      Comparison == "1 - 2" ~ "padj_C1_vs_C2",
+      Comparison == "1 - 3" ~ "padj_C1_vs_C3",
+      Comparison == "2 - 3" ~ "padj_C2_vs_C3",
+      TRUE ~ NA_character_)) %>%
+  filter(!is.na(comparison_clean)) %>%
+  select(otu_id, comparison_clean, P.adj) %>%
+  pivot_wider(names_from = comparison_clean, values_from = P.adj)
+
+# Merge all results
+taxa_full <- taxa_means %>%
+  inner_join(taxa_stats, by = "otu_id") %>%
+  left_join(pairwise_results, by = "otu_id") %>%
+  left_join(tax_table_df, by = "otu_id") %>%
+  filter(
+    padj_kruskal < 0.05,
+    (prevalence_Cluster_1 > 0.10 | prevalence_Cluster_2 > 0.10 | prevalence_Cluster_3 > 0.10)) %>%
+  mutate(
+    taxa_label = ifelse(!is.na(Species) & Species != "", Species,
+                       ifelse(!is.na(Genus) & Genus != "", Genus,
+                             ifelse(!is.na(Family) & Family != "", Family, otu_id))))
+
+# Prepare comparison data for plotting
+comparison_data <- taxa_full %>%
+  select(
+    taxa_label,
+    diff_C1_vs_C2, diff_C1_vs_C3, diff_C2_vs_C3,
+    padj_C1_vs_C2, padj_C1_vs_C3, padj_C2_vs_C3) %>%
+  pivot_longer(cols = starts_with("diff"),
+               names_to = "comparison_type",
+               values_to = "mean_diff") %>%
+  mutate(
+    padj_value = case_when(
+      comparison_type == "diff_C1_vs_C2" ~ padj_C1_vs_C2,
+      comparison_type == "diff_C1_vs_C3" ~ padj_C1_vs_C3,
+      comparison_type == "diff_C2_vs_C3" ~ padj_C2_vs_C3),
+    comparison_label = case_when(
+      comparison_type == "diff_C1_vs_C2" ~ "Cluster 1 vs 2",
+      comparison_type == "diff_C1_vs_C3" ~ "Cluster 1 vs 3",
+      comparison_type == "diff_C2_vs_C3" ~ "Cluster 2 vs 3"),
+    sig_star = case_when(
+      is.na(padj_value) ~ "",
+      padj_value < 0.001 ~ "***",
+      padj_value < 0.01 ~ "**",
+      padj_value < 0.05 ~ "*",
+      TRUE ~ ""),
+    # Flip sign so Cluster 1 appears on left
+    mean_diff_flipped = -mean_diff,
+    enriched_cluster = case_when(
+      comparison_type == "diff_C1_vs_C2" & mean_diff > 0 ~ "1",
+      comparison_type == "diff_C1_vs_C2" & mean_diff < 0 ~ "2",
+      comparison_type == "diff_C1_vs_C3" & mean_diff > 0 ~ "1",
+      comparison_type == "diff_C1_vs_C3" & mean_diff < 0 ~ "3",
+      comparison_type == "diff_C2_vs_C3" & mean_diff > 0 ~ "2",
+      comparison_type == "diff_C2_vs_C3" & mean_diff < 0 ~ "3",
+      TRUE ~ NA_character_))
+
+# Fix factor levels
+comparison_data$enriched_cluster <- factor(comparison_data$enriched_cluster, 
+                                          levels = c("1","2","3"))
+comparison_data$comparison_label <- factor(comparison_data$comparison_label,
+                                          levels = c("Cluster 1 vs 2", 
+                                                    "Cluster 1 vs 3", 
+                                                    "Cluster 2 vs 3"))
+
+# Function to create individual comparison plot
+make_comp_plot <- function(df, label, top_n = 30) {
+  df1 <- df %>%
+    filter(comparison_label == label,
+           !is.na(mean_diff_flipped),
+           !is.na(padj_value),
+           padj_value < 0.05) %>%
+    slice_max(order_by = abs(mean_diff_flipped), n = top_n, with_ties = FALSE) %>%
+    mutate(taxa_label = reorder(taxa_label, abs(mean_diff_flipped)))
+
+  xr <- range(df1$mean_diff_flipped, na.rm = TRUE)
+  pad <- 0.02 * diff(xr)
+  if (!is.finite(pad) || pad == 0) pad <- 0.01
+
+  df1 <- df1 %>%
+    mutate(
+      star_x = ifelse(mean_diff_flipped >= 0, mean_diff_flipped + pad, mean_diff_flipped - pad),
+      star_hjust = ifelse(mean_diff_flipped >= 0, 0, 1))
+
+  ggplot(df1, aes(x = mean_diff_flipped, y = taxa_label, fill = enriched_cluster)) +
+    geom_vline(xintercept = 0, linewidth = 0.4) +
+    geom_col(color = "black", linewidth = 0.3) +
+    geom_text(aes(x = star_x, label = sig_star, hjust = star_hjust),
+              size = 3.2, fontface = "bold", color = "black") +
+    labs(
+      title = label,
+      x = "Mean Difference in Relative Abundance (%)",
+      y = "Species") +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+      axis.text.y = element_text(face = "italic", size = 10, color = "black"),
+      axis.text.x = element_text(size = 9, color = "black"),
+      axis.title = element_text(face = "bold", size = 10),
+      panel.border = element_rect(color = "black", linewidth = 0.8),
+      plot.margin = margin(4, 6, 4, 4)) +
+    scale_x_continuous(expand = expansion(mult = c(0.10, 0.15)))}
+
+# Create the three comparison plots
+p_c12 <- make_comp_plot(comparison_data, "Cluster 1 vs 2", top_n = 30)
+p_c13 <- make_comp_plot(comparison_data, "Cluster 1 vs 3", top_n = 30)
+p_c23 <- make_comp_plot(comparison_data, "Cluster 2 vs 3", top_n = 30)
+
+# Shared fill scale (one legend)
+shared_fill_scale <- scale_fill_manual(
+  values = cluster_colors_k3,
+  limits = c("1","2","3"),
+  breaks = c("1","2","3"),
+  labels = c("Cluster 1", "Cluster 2", "Cluster 3"),
+  drop = FALSE,
+  name = "Higher in")
+
+# Add legend only to first plot
+p_c12 <- p_c12 +
+  shared_fill_scale +
+  guides(fill = guide_legend(title = "Higher in", nrow = 1, byrow = TRUE)) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    legend.key.size = unit(0.65, "cm"),
+    legend.spacing.x = unit(0.35, "cm"))
+
+p_c13 <- p_c13 + shared_fill_scale + theme(legend.position = "none")
+p_c23 <- p_c23 + shared_fill_scale + theme(legend.position = "none")
+
+# Combine all three comparisons
+panel_b <- (p_c12 | p_c13 | p_c23) +
+  plot_layout(widths = c(1.15, 1, 1))
+
+print(panel_b)
+ggsave("Panel_B_all_comparisons.pdf", panel_b, 
+       width = 16.5, height = 7.6, dpi = 300)
+
+###############################################################################
+#                PANEL C: INCOME DISTRIBUTION ACROSS CLUSTERS                #
+
+
+# Calculate income proportions per cluster
+income_cluster_counts <- pcoa_df_k3 %>%
+  count(cluster, income_group) %>%
+  group_by(cluster) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+# Create abbreviated income labels
+income_data <- income_cluster_counts %>%
+  mutate(
+    income_abbrev = factor(
+      case_when(
+        income_group == "Low" ~ "LIC",
+        income_group == "Lower middle" ~ "LMIC",
+        income_group == "Upper middle" ~ "UMIC",
+        income_group == "High" ~ "HIC",
+        TRUE ~ as.character(income_group)),
+      levels = c("LIC", "LMIC", "UMIC", "HIC")))
+
+# Create income distribution plot
+panel_c <- ggplot(income_data,
+                  aes(x = cluster, y = percentage / 100, fill = income_abbrev)) +
+  geom_col(color = "black", linewidth = 0.6, width = 0.6) +
+  scale_fill_manual(values = income_colors, name = "Income Group") +
+  scale_y_continuous(
+    labels = percent_format(),
+    limits = c(0, 1.05),
+    expand = expansion(mult = c(0, 0.02))) +
+  annotate("text", x = 1, y = 1.02, label = "p < 0.001", hjust = 0, size = 4.5) +
+  labs(x = "Cluster", y = "Proportion") +
+  scale_x_discrete(labels = c("1", "2", "3")) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.margin = margin(2, 2, 2, 2),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 11),
+    legend.text = element_text(size = 10),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10, color = "black"),
+    panel.border = element_rect(color = "black", linewidth = 1))
+
+print(panel_c)
